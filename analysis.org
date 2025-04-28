@@ -1,0 +1,1933 @@
+#+STARTUP: fold indent noinlineimages logdrawer
+#+TITLE: Lab Notebook for Transformer Kernel Performance Modeling
+#+AUTHOR: Pedro Bruel
+#+EMAIL: bruel@hpe.com
+#+LANGUAGE: en
+
+#+TAGS: noexport(n)
+#+TAGS: ignore(i)
+
+#+OPTIONS: prop:nil
+#+OPTIONS: H:3 num:t toc:nil \n:nil @:t ::t |:t ^:t -:t f:t *:t <:t
+#+OPTIONS: TeX:t LaTeX:t skip:nil d:nil todo:t pri:nil tags:not-in-toc
+#+EXPORT_SELECT_TAGS: export
+#+EXPORT_EXCLUDE_TAGS: noexport
+#+COLUMNS: %25ITEM %TODO %3PRIORITY %TAGS
+#+SEQ_TODO: TODO(t!) STARTED(s!) WAITING(w@) APPT(a!) | DONE(d!) CANCELLED(c!) DEFERRED(f!)
+
+* Headers and Configuration
+** Latex
+:latex_headers:
+#+LATEX_CLASS_OPTIONS: [11pt,a4paper]
+#+LATEX_HEADER: \usepackage[margin=3cm]{geometry}
+#+LATEX_HEADER: \usepackage{lmodern}
+#+LATEX_HEADER: \usepackage{textcomp}
+#+LATEX_HEADER: \usepackage{booktabs}
+#+LATEX_HEADER: \usepackage{array}
+#+LATEX_HEADER: \usepackage[table,x11names,dvipsnames,table]{xcolor}
+#+LATEX_HEADER: \usepackage{colortbl}
+#+LATEX_HEADER: \usepackage{listings}
+#+LATEX_HEADER: \usepackage{algpseudocode}
+#+LATEX_HEADER: \usepackage{algorithm}
+#+LATEX_HEADER: \usepackage{graphicx}
+#+LATEX_HEADER: \usepackage[english]{babel}
+#+LATEX_HEADER: \usepackage[utf8]{inputenc}
+#+LATEX_HEADER: \usepackage[scale=2]{ccicons}
+#+LATEX_HEADER: \usepackage{hyperref}
+#+LATEX_HEADER: \usepackage{relsize}
+#+LATEX_HEADER: \usepackage{amsmath}
+#+LATEX_HEADER: \usepackage{bm}
+#+LATEX_HEADER: \usepackage{amsfonts}
+#+LATEX_HEADER: \usepackage{wasysym}
+#+LATEX_HEADER: \usepackage{float}
+#+LATEX_HEADER: \usepackage{ragged2e}
+#+LATEX_HEADER: \usepackage{pgfplots}
+#+LATEX_HEADER: \usepackage{todonotes}
+#+LATEX_HEADER: \usepgfplotslibrary{dateplot}
+#+LATEX_HEADER: \renewcommand*{\UrlFont}{\ttfamily\smaller\relax}
+#+LATEX_HEADER: \usepackage{fancyhdr}
+#+LATEX_HEADER: \pagestyle{fancy}
+#+LATEX_HEADER: \fancyhf{}
+#+LATEX_HEADER: \newcommand{\tmpx}{}
+#+LATEX_HEADER: \newcommand\tmp[1]{\renewcommand{\tmpx}{#1}}
+#+LATEX_HEADER: \fancypagestyle{sec}{\rhead{\tmpx}}
+
+#+LATEX_HEADER: \usepackage[style=numeric,backend=bibtex]{biblatex}
+:end:
+* R Packages
+Ensure R is installed. Then install these packages:
+
+#+begin_SRC R :tangle requirements.R
+options(error = function() { quit(save = "no", status = 1) })
+
+.libPaths("/usr/local/lib/R/site-library")
+
+check_and_install_packages <- function(packages) {
+  # Identify packages that are not installed
+  missing_packages <- packages[!packages %in% installed.packages()[, "Package"]]
+
+  # Install missing packages
+  if (length(missing_packages) > 0) {
+    install.packages(missing_packages)
+  } else {
+    message("All packages are already installed.")
+  }
+}
+
+# Example usage
+required_packages <- c("tidyverse", "RColorBrewer", "patchwork", "ggh4x", "ggtext",
+                       "scales", "latex2exp")
+
+check_and_install_packages(required_packages)
+#+end_SRC
+
+* Setup (Run it first!)
+
+Silence annoying ouput by default.
+
+#+BEGIN_SRC R :tangle generate_plots.R
+options(error = function() { quit(save = "no", status = 1) })
+options(tidyverse.quiet = TRUE)
+options(readr.show_progress = FALSE)
+options(readr.show_col_types = FALSE)
+#+END_SRC
+
+#+RESULTS:
+
+* Experiments for SC25 Submission
+** Kernel modeling and plotting
+*** Load Kernel Measurements Data
+#+BEGIN_SRC R :tangle generate_plots.R
+library(tidyverse)
+
+data_dir <- "results/sc25/raw_kernel_profiling_data/a100_mean_factorial_expanded"
+
+scaled_csv_files <- list.files(path = data_dir,
+                               pattern = "scaled_experiments\\.csv$",
+                               full.names = TRUE,
+                               recursive = TRUE)
+
+scaled_combined_df <- scaled_csv_files |>
+    lapply(read_csv) |>
+    bind_rows() |>
+    write_csv("results/sc25/scaled_kernel_profiling_data.csv")
+
+normalized_csv_files <- list.files(path = data_dir,
+                                   pattern = "normalized_experiments\\.csv$",
+                                   full.names = TRUE,
+                                   recursive = TRUE)
+
+normalized_combined_df <- normalized_csv_files |>
+    lapply(read_csv) |>
+    bind_rows() |>
+    write_csv("results/sc25/normalized_kernel_profiling_data.csv")
+#+END_SRC
+
+#+RESULTS:
+
+*** Plots
+**** Scaled scatter of all parameter values against runtime, for each kernel group and GPU
+***** Load and process data
+#+BEGIN_SRC R :tangle generate_plots.R
+library(tidyverse)
+
+df <- read_csv("results/sc25/scaled_kernel_profiling_data.csv",
+               show_col_types = FALSE) |>
+    filter(!is.na(runtime_s)) |>
+    mutate(seq_length_filled = coalesce(seq_length,
+                                        max_seq_length)) |>
+    mutate(seq_length = seq_length_filled) |>
+    select(batch,
+           seq_length,
+           n_head,
+           n_embed,
+           tensor_parallelism,
+           kernel,
+           gpu_name,
+           runtime_s) |>
+    mutate(dot_color = batch) |>
+    pivot_longer(cols = -c("kernel",
+                           "gpu_name",
+                           "dot_color",
+                           "runtime_s"),
+                 names_to = "parameter",
+                 values_to = "value") |>
+    filter(!is.na(runtime_s))
+#+END_SRC
+
+#+RESULTS:
+
+***** Facet wrap plot
+#+BEGIN_SRC R :tangle generate_plots.R
+library(tidyverse)
+library(RColorBrewer)
+library(patchwork)
+library(ggh4x)
+library(ggtext)
+
+legend_text_size <- 15
+legend_title_size <- 15
+legend_key_size <- 1.5
+legend_bar_width <- 30
+legend_bar_height <- 0.25
+plot_title_size <- 15
+axis_title_size <- 15
+plot_base_size <- 16
+strip_text_size <- 15
+
+kernel_values <- unique(df$kernel)
+plots_list <- list()
+
+color_palette <- "Spectral"
+
+for (k in kernel_values) {
+    kernel_df <- df %>%
+        filter(kernel == k) %>%
+        filter(!is.na(value))
+
+    legend_pos <- if(k == tail(kernel_values, 1)) "bottom" else "none"
+
+    p <- ggplot(kernel_df, aes(x = value, y = runtime_s, color = dot_color)) +
+        geom_jitter(width = 0.35, height = 0, size = 1.1, alpha = 0.9) +
+        geom_smooth(data = kernel_df |> filter(dot_color %in% c(1, 16, 128)),
+                    aes(color = dot_color,
+                        group = dot_color),
+                    se = TRUE,
+                    alpha = 0.4,
+                    method = "lm",
+                    formula = y ~ x) +
+        facet_grid2(
+            . ~ parameter,
+            scales = "free"
+        ) +
+        labs(x = paste0("Parameter values for ", k),
+             y = "Time (s)") +
+        scale_color_distiller(name = "Batch", palette = color_palette, trans = "log2") +
+        scale_y_log10(labels = function(x) {
+            exponents <- round(log10(x), 1)
+            labels <- ifelse(exponents < 0,
+                             paste0("10^{-", "~", abs(exponents), "}"),
+                             paste0("10^{", exponents, "}"))
+            parse(text = labels)
+        }, n.breaks = 4) +
+        scale_x_continuous(
+            trans = "log2",
+            n.breaks = 4,
+            labels = function(x) parse(text = paste0("2^{", round(log2(x), 1), "}"))
+        ) +
+        guides(color = guide_colorbar(
+                   title.position = "top",
+                   barwidth = unit(legend_bar_width, "cm"),
+                   barheight = unit(legend_bar_height, "cm"),
+                   ticks = TRUE,
+                   frame.colour = "black",
+                   frame.linewidth = 0.0
+               )) +
+        theme_bw(base_size = plot_base_size) +
+        theme(
+            strip.background = element_rect(fill = "white", color = "gray80"),
+            strip.text = element_text(size = strip_text_size),
+            legend.position = legend_pos,
+            legend.box.margin = margin(l = -850, unit = "pt"),
+            legend.box = "horizontal",
+            legend.text = element_text(size = legend_text_size),
+            legend.title = element_text(size = legend_title_size),
+            legend.key.size = unit(legend_key_size, "lines"),
+            plot.title = element_text(size = plot_title_size, hjust = 0),
+            axis.title = element_text(size = axis_title_size)
+        )
+
+    plots_list[[k]] <- p
+}
+
+#combined_plot <- wrap_plots(plots_list, ncol = 2)
+combined_plot <- (plots_list[[1]] / plots_list[[2]]) / (plots_list[[3]] + plots_list[[4]])
+ggsave("results/sc25/figures/combined_kernel_plots.png",
+       combined_plot, width = 20, height = 11, dpi = 600)
+#+END_SRC
+
+#+RESULTS:
+
+** ASTRA-sim data and comparisons
+*** Define functions
+#+BEGIN_SRC R :tangle generate_plots.R
+library(tidyverse)
+library(patchwork)
+library(RColorBrewer)
+library(ggtext)
+library(latex2exp)
+
+options(tidyverse.quiet = TRUE)
+options(readr.show_progress = FALSE)
+options(readr.show_col_types = FALSE)
+
+find_all_files <- function(path, pattern, recursive = TRUE) {
+    list.files(path = path,
+               pattern = pattern,
+               recursive = recursive,
+               full.names = TRUE)
+}
+
+load_files_in_batches <- function(files, batch_size = 500) {
+    batch_no <- (seq_along(files) - 1) %/% batch_size
+
+    split(files, batch_no) |>
+        purrr::map_df(function(x) {
+            read_csv(x,
+                    id = "origin_file",
+                    show_col_types = FALSE,
+                    name_repair = "minimal")
+        })
+}
+
+format_simulation_data <- function(df_sim_full) {
+    df_sim_full |>
+        select(origin_file, `workload finished at`) |>
+        drop_na() |>
+        separate_wider_regex(origin_file,
+                             c("results/sc25/astra_sim_measurements/",
+                               gpu = ".*?", "/",
+                               type = ".*?", "/", gpus = "\\d+",
+                               "_gpu_", ubatch = "\\d", "_ubatch_",
+                               coef = "\\d+(?:\\.\\d+)?|.*?", "_coef_",
+                               rep = "\\d+", ".*"), too_few = "align_start") |>
+        group_by(type, gpus, ubatch, coef) |>
+        summarize(total_time_ms = mean(`workload finished at` / 1e6),
+                  total_time_ms_ci = (1.97 * sd(`workload finished at` / 1e6)) / sqrt(n())) |>
+        ungroup() |>
+        mutate(total_time_ms_ci = ifelse(is.na(total_time_ms_ci), 0.0, total_time_ms_ci))
+}
+
+load_and_format_real_data <- function(path_pattern, origin_file_pattern = ".*?llama-7B_NVIDIA-A100-SXM4-80GB_gpu-") {
+    read_csv(list.files(path = path_pattern$path,
+                        pattern = path_pattern$pattern,
+                        recursive = TRUE,
+                        full.names = TRUE),
+             id = "origin_file") |>
+        group_by(origin_file) |>
+        slice(3:n()) |> # Drop two first runs
+        summarize(total_time_ms = mean(Back + Fwd) / 1e3,
+                  total_time_ms_mean = mean(Back + Fwd) / 1e3,
+                  total_time_ms_ci = ((1.97 * sd(Back + Fwd) / sqrt(n()))) / 1e3) |>
+        ungroup() |>
+        select(origin_file, total_time_ms, total_time_ms_ci) |>
+        separate_wider_regex(origin_file,
+                             c(origin_file_pattern,
+                               gpus = "\\d+", "_batch-",
+                               ubatch = "\\d+", ".*")) |>
+        mutate(type = "real")
+}
+
+adjust_data_and_save <- function(df_sim, df_real, output_path) {
+    df <- bind_rows(df_sim, df_real)
+
+    # Apply adjustments
+    df[df$type == "roofline", "total_time_ms"] <- df[df$type == "roofline", "total_time_ms"] * 8
+
+    write_csv(df, output_path)
+    return(df)
+}
+
+load_performance_data <- function(file_path) {
+    read_csv(file_path)
+}
+
+create_reference_dataframe <- function(df) {
+    df |>
+        filter(type == "real") |>
+        select(gpus, ubatch, total_time_ms, ref_time = total_time_ms)
+}
+
+calculate_performance_ratios <- function(df, ref_df) {
+    df |>
+        left_join(ref_df, by = c("gpus", "ubatch")) |>
+        group_by(type, gpus, ubatch) |>
+        mutate(ratio_time_ms = total_time_ms / ref_time) |>
+        ungroup() |>
+        mutate(abs_diff_ratio = abs(ratio_time_ms - 1)) |>
+        group_by(type, gpus, ubatch) |>
+        filter(abs_diff_ratio == min(abs_diff_ratio)) |>
+        ungroup()
+}
+
+save_and_print_ratios <- function(ratio_df, output_file) {
+    ratio_df |> write_csv(output_file)
+    #ratio_df |> print(n = Inf)
+    return(ratio_df)
+}
+
+prepare_model_data <- function(ratio_df, type_filter = "model", ubatch_filter = 1) {
+    ratio_df |>
+        filter(type == type_filter,
+               ubatch > ubatch_filter) |>
+        select(gpus,
+               ubatch,
+               coef,
+               total_time_ms,
+               abs_diff_ratio) |>
+        mutate_all(~ as.numeric(.))
+}
+
+fit_coefficient_model <- function(df_lm, formula_str = "coef ~ log(ubatch) + log(gpus) + I(1/ubatch) + I(1/gpus)") {
+    model <- lm(data = df_lm, formula = formula_str)
+    print(summary(model))
+    return(model)
+}
+
+create_coefficient_heatmap <- function(input_file, output_file, grid_size = 64,
+                                       max_ubatch = 64, max_gpus = 16,
+                                       width = 10, height = 5) {
+    # Get the data ready
+    df <- read_csv(input_file)
+
+    # Create the fitted models
+    model_fit <- lm(coef ~ (I(1/ubatch) + I(1/gpus) + gpus),
+                    data = filter(df, type == "model"))
+    profiling_fit <- lm(coef ~ (I(1/ubatch) + I(1/gpus) + gpus),
+                        data = filter(df, type == "profiling"))
+
+    # Create a grid of values for prediction
+    ubatch_range <- seq(min(df$ubatch), max_ubatch, length.out = grid_size)
+    gpus_range <- seq(min(df$gpus), max_gpus, length.out = grid_size)
+    prediction_grid <- expand.grid(ubatch = ubatch_range, gpus = gpus_range)
+
+    # Make predictions
+    prediction_grid$model_pred <- predict(model_fit, newdata = prediction_grid)
+    prediction_grid$profiling_pred <- predict(profiling_fit, newdata = prediction_grid)
+    prediction_grid$difference <- prediction_grid$model_pred - prediction_grid$profiling_pred
+
+    # Convert to long format for easier plotting
+    pred_long <- prediction_grid %>%
+        pivot_longer(cols = c(model_pred, profiling_pred, difference),
+                     names_to = "type",
+                     values_to = "prediction")
+
+    # Create heatmaps
+    p <- ggplot(pred_long, aes(x = ubatch, y = gpus, fill = prediction)) +
+        geom_tile() +
+        scale_fill_gradientn(
+            colors = rev(brewer.pal(11, "RdBu")),
+            values = scales::rescale(c(min(pred_long$prediction), 1.0, max(pred_long$prediction))),
+            limits = c(min(pred_long$prediction), max(pred_long$prediction))
+        ) +
+        facet_wrap(~ type, ncol = 3,
+                   labeller = labeller(type = c("model_pred" = "Model",
+                                               "profiling_pred" = "Profiling",
+                                               "difference" = "Difference"))) +
+        labs(title = "Predictions from the Fitted Models",
+             x = "ubatch", y = "gpus", fill = "Coefficient") +
+        theme_minimal() +
+        theme(panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank())
+
+    # Save the plot
+    ggsave(output_file, p, width = width, height = height)
+
+    return()
+}
+
+create_coefficient_trend_plots <- function(input_file, output_file,
+                                          grid_size = 32, max_ubatch = 8, max_gpus = 128,
+                                          output_width = 12, output_height = 10) {
+    # Visual parameters
+    line_alpha <- 0.5
+    line_width <- 1.3
+    point_alpha <- 0.5
+    point_size <- 1.5
+    color_palette <- "Spectral"
+    reference_line_color <- "darkgray"
+    reference_line_type <- "dashed"
+    reference_line_value <- 1.0
+    plot_base_size <- 12
+
+    # Text parameters
+    main_title <- "Coefficient Trends for Simulation Methods"
+    main_subtitle <- "Values closer to 1.0 indicate better alignment with ground truth"
+    gpus_plot_title <- "Coefficient by GPU Count"
+    gpus_plot_subtitle_base <- "Each line represents a different batch size"
+    ubatch_plot_title <- "Coefficient by Batch Size"
+    ubatch_plot_subtitle <- "Each line represents a different GPU count"
+    x_label_gpus <- "GPUs"
+    x_label_ubatch <- "Batch Size"
+    y_label <- "Predicted Coefficient"
+
+    # Model parameters
+    simpler_formula_template <- "coef = %s + (%s)*1/ubatch + (%s)*1/gpus, Adj R² = %s"
+    model_prediction_columns <- c("model_pred", "profiling_pred")
+    model_type_levels <- c("model_pred", "profiling_pred")
+    model_type_labels <- c("Model", "Profiling")
+
+    # Get the data ready
+    df <- read_csv(input_file)
+
+    # Create the fitted models
+    model_fit <- lm(coef ~ (I(1/ubatch) + I(1/gpus)),
+                    data = filter(df, type == "model"))
+    profiling_fit <- lm(coef ~ (I(1/ubatch) + I(1/gpus)),
+                        data = filter(df, type == "profiling"))
+
+    # Format model formulas
+    model_formula <- sprintf(simpler_formula_template,
+                             round(coef(model_fit)[1], 3),
+                             round(coef(model_fit)[2], 3),
+                             round(coef(model_fit)[3], 3),
+                             round(summary(model_fit)$adj.r.squared, 3))
+    prof_formula <- sprintf(simpler_formula_template,
+                            round(coef(profiling_fit)[1], 3),
+                            round(coef(profiling_fit)[2], 3),
+                            round(coef(profiling_fit)[3], 3),
+                            round(summary(profiling_fit)$adj.r.squared, 3))
+
+    # Create combined title with formulas
+    gpus_plot_subtitle <- paste0(gpus_plot_subtitle_base, " \nModel: ", model_formula,
+                                 "\nProfiler: ", prof_formula)
+
+    # Create a dense grid for predictions
+    ubatch_range <- seq(min(df$ubatch), max_ubatch, length.out = grid_size)
+    gpus_range <- seq(min(df$gpus), max_gpus, length.out = grid_size)
+    prediction_grid <- expand.grid(ubatch = ubatch_range, gpus = gpus_range)
+
+    # Make predictions
+    prediction_grid$model_pred <- predict(model_fit, newdata = prediction_grid)
+    prediction_grid$profiling_pred <- predict(profiling_fit, newdata = prediction_grid)
+
+    pred_long <- prediction_grid %>%
+        pivot_longer(cols = model_prediction_columns,
+                     names_to = "source",
+                     values_to = "prediction") %>%
+        mutate(source = factor(source,
+                               levels = model_type_levels,
+                               labels = model_type_labels))
+
+    # Create GPUs plot
+    gpus_plot <- ggplot(pred_long, aes(x = gpus, y = prediction)) +
+        geom_line(aes(group = interaction(source, ubatch), color = ubatch),
+                  alpha = line_alpha, linewidth = line_width) +
+        geom_point(aes(color = ubatch),
+                   alpha = point_alpha, size = point_size) +
+        geom_hline(yintercept = reference_line_value,
+                   linetype = reference_line_type,
+                   color = reference_line_color) +
+        geom_jitter(data = df |>
+                        filter(type == "model" | type == "profiling") |>
+                        mutate(source = factor(type,
+                                               levels = c("model", "profiling"),
+                                               labels = model_type_labels)),
+                    aes(x = gpus,
+                        y = as.numeric(coef)),
+                    color = "black",
+                    width = 0,
+                    height = 0,
+                    alpha = 0.7,
+                    size = 1.5,
+                    show.legend = FALSE) +
+        facet_wrap(~ source) +
+        scale_color_distiller(palette = color_palette) +
+        labs(
+            title = gpus_plot_title,
+            subtitle = gpus_plot_subtitle,
+            x = x_label_gpus,
+            y = y_label
+        ) +
+        theme_bw(base_size = plot_base_size) +
+        theme(
+            legend.position = "right",
+            strip.background = element_rect(fill = "white")
+        )
+
+    # Create ubatch plot
+    ubatch_plot <- ggplot(pred_long, aes(x = ubatch, y = prediction)) +
+        geom_line(aes(group = interaction(source, gpus), color = gpus),
+                  alpha = line_alpha, linewidth = line_width) +
+        geom_point(aes(color = gpus),
+                   alpha = point_alpha, size = point_size) +
+        geom_hline(yintercept = reference_line_value,
+                   linetype = reference_line_type,
+                   color = reference_line_color) +
+        geom_jitter(data = df |>
+                        filter(type == "model" | type == "profiling") |>
+                        mutate(source = factor(type,
+                                               levels = c("model", "profiling"),
+                                               labels = model_type_labels)),
+                    aes(x = ubatch,
+                        y = as.numeric(coef)),
+                    color = "black",
+                    width = 0,
+                    height = 0,
+                    alpha = 0.7,
+                    size = 1.5,
+                    show.legend = FALSE) +
+        facet_wrap(~ source) +
+        scale_color_distiller(palette = color_palette) +
+        labs(
+            title = ubatch_plot_title,
+            subtitle = ubatch_plot_subtitle,
+            x = x_label_ubatch,
+            y = y_label
+        ) +
+        theme_bw(base_size = plot_base_size) +
+        theme(
+            legend.position = "right",
+            strip.background = element_rect(fill = "white")
+        )
+
+    # Combine plots and save
+    final_plot <- gpus_plot / ubatch_plot +
+        plot_annotation(
+            title = main_title,
+            subtitle = main_subtitle,
+            theme = theme(
+                plot.title = element_text(face = "bold", size = 14),
+                plot.subtitle = element_text(face = "italic", size = 12)
+            )
+        )
+
+    ggsave(output_file, final_plot, width = output_width, height = output_height)
+
+    return()
+}
+
+create_performance_comparison_plot <- function(input_file = "results/sc25/simulation_results/performance_ratios_A100_factorial_expanded.csv",
+                                               output_file = "results/sc25/figures/model_profiling_comparison_A100_factorial_expanded.pdf",
+                                               width = 12,
+                                               height = 8) {
+    library(tidyverse)
+
+    df <- read_csv(input_file)
+
+    ground_truth <- df %>%
+        filter(type == "real") %>%
+        select(gpus, ubatch, reference = total_time_ms, total_time_ms_ci)
+
+    plot_data <- df %>%
+        filter(type %in% c("roofline", "profiling", "model")) %>%
+        left_join(ground_truth, by = c("gpus", "ubatch", "total_time_ms_ci")) %>%
+        select(ubatch, gpus, type, total_time_ms, total_time_ms_ci, reference) %>%
+        mutate(
+            ubatch = factor(ubatch,
+                            levels = c("1", "2", "4", "8"),
+                            labels = c("Batch 1", "Batch 2", "Batch 4", "Batch 8")),
+            gpus = factor(gpus,
+                          levels = c("1", "2", "4", "8", "16",
+                                     "32", "64", "128"),
+                          labels = c("1 GPU", "2 GPUs", "4 GPUs", "8 GPUs",
+                                     "16 GPUs", "32 GPUs", "64 GPUs", "128 GPUs")),
+            type = factor(type,
+                          levels = c("roofline", "profiling", "model"),
+                          labels = c("roofline", "profiler", "model"))
+        )
+
+    ground_truth_formatted <- ground_truth %>%
+        mutate(
+            ubatch = factor(ubatch,
+                            levels = c("1", "2", "4", "8"),
+                            labels = c("Batch 1", "Batch 2", "Batch 4", "Batch 8")),
+            gpus = factor(gpus,
+                          levels = c("1", "2", "4", "8",
+                                     "16", "32", "64", "128"),
+                          labels = c("1 GPU", "2 GPUs", "4 GPUs", "8 GPUs",
+                                     "16 GPUs", "32 GPUs", "64 GPUs", "128 GPUs")),
+            )
+
+    p <- ggplot() +
+        geom_rect(
+            data = ground_truth_formatted,
+            aes(
+                xmin = -Inf,
+                xmax = Inf,
+                ymin = reference - total_time_ms_ci,
+                ymax = reference + total_time_ms_ci
+            ),
+            fill = "grey",
+            alpha = 0.6,
+            inherit.aes = FALSE
+        ) +
+        geom_crossbar(data = plot_data, aes(x = type,
+                                            y = total_time_ms,
+                                            ymin = total_time_ms - total_time_ms_ci,
+                                            ymax = total_time_ms + total_time_ms_ci,
+                                            color = type,
+                                            fill = type),
+                      alpha = 0.4,
+                      width = 0.2) +
+        geom_hline(data = ground_truth_formatted,
+                   aes(yintercept = reference),
+                   linetype = "dashed",
+                   color = "black") +
+        geom_text(data = ground_truth_formatted,
+                  aes(x = 1.1,
+                      y = reference,
+                      label = paste0("Ground Truth: ", round(reference, 2))),
+                  vjust = -0.5, size = 3, color = "black") +
+        geom_text(data = plot_data,
+                  aes(x = type,
+                      y = total_time_ms + total_time_ms_ci,
+                      color = type,
+                      label = round(total_time_ms, 2)),
+                  vjust = -2.2, size = 3) +
+        scale_color_brewer(palette = "Dark2") +
+        scale_fill_brewer(palette = "Dark2") +
+        guides(color = guide_legend(label = FALSE)) +
+        facet_grid(ubatch ~ gpus, scales = "free_y") +
+        labs(
+            x = "Simulation Method",
+            y = "Time (s)",
+            title = "Comparison of Performance Simulation Methods"
+        ) +
+        scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+        theme_bw() +
+        theme(
+            legend.position = "none",
+            strip.background = element_rect(fill = "white"),
+            plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+        )
+
+    dir.create(dirname(output_file), showWarnings = FALSE, recursive = TRUE)
+    ggsave(output_file, p, width = width, height = height)
+
+    return()
+}
+
+coefficient_trend_plots_publication <- function(input_file, output_file,
+                                                grid_size = 32, max_ubatch = 2, max_gpus = 128,
+                                                output_width = 12, output_height = 10) {
+    legend_bar_height <- 6.5
+    legend_bar_width <- 0.25
+    line_alpha <- 0.5
+    line_width <- 2
+    point_alpha <- 0.5
+    point_size <- 2
+    color_palette <- "Set1"
+    reference_line_color <- "black"
+    reference_line_type <- "dashed"
+    reference_line_value <- 1.0
+    plot_base_size <- 18
+
+    main_title <- "Coefficient Trends for Simulation Methods"
+    main_subtitle <- "Values closer to 1.0 indicate better alignment with ground truth"
+    gpus_plot_title <- "Coefficient by GPU Count"
+    gpus_plot_subtitle_base <- "Each line represents a different batch size"
+    ubatch_plot_title <- "Coefficient by Batch Size"
+    ubatch_plot_subtitle <- "Each line represents a different GPU count"
+    x_label_gpus <- "GPUs"
+    x_label_ubatch <- "Batch Size"
+    y_label <- "Correction Coefficient"
+
+    # simpler_formula_template <- "$\\approx %.2f + \\left(%.2f log(ubatch)\\right) + \\left(%.2f log(gpus)\\right) + \\left(\\frac{%.2f}{ubatch}\\right) + \\left(\\frac{%.2f}{gpus}\\right)\\,, R^2=%.2f$"
+    simpler_formula_template <- "$\\approx %.2f + %.2f \\cdot log(ubatch) + %.2f \\cdot log(gpus)$"
+    R2_template <- "$R^2 = %.2f$"
+    model_formula_template <- simpler_formula_template
+    model_prediction_columns <- c("model_pred")
+    model_type_levels <- c("model_pred")
+    model_type_labels <- c("Model")
+
+    df <- read_csv(input_file) |>
+        mutate(ubatch = as.numeric(ubatch)) |>
+        filter(ubatch <= 2,
+               type == "model")
+        #filter(type == "model")
+
+    print(df |> distinct(ubatch))
+
+    # model_fit <- lm(coef ~ (I(1/ubatch) + I(1/gpus)),
+    #                 data = filter(df, type == "model"))
+
+    model_fit <- lm(coef ~ (log(ubatch) + log(gpus)),
+                    data = filter(df, type == "model"))
+
+    print(summary(model_fit))
+
+    model_formula <- sprintf(model_formula_template,
+                             coef(model_fit)[1],
+                             coef(model_fit)[2],
+                             coef(model_fit)[3])
+
+    model_r2 <- sprintf(R2_template,
+                        summary(model_fit)$adj.r.squared)
+
+    #ubatch_range <- seq(min(df$ubatch), max_ubatch, length.out = grid_size)
+    #ubatch_range <- seq(min(df$ubatch), max_ubatch, length.out = grid_size)
+    ubatch_range <- c(1, 2, 4)
+    gpus_range <- c(1, 2, 4, 8, 16, 32, 64, 128)
+    prediction_grid <- expand.grid(ubatch = ubatch_range, gpus = gpus_range)
+
+    prediction_grid$model_pred <- predict(model_fit, newdata = prediction_grid)
+
+    pred_long <- prediction_grid %>%
+        pivot_longer(cols = model_prediction_columns,
+                     names_to = "source",
+                     values_to = "prediction") %>%
+        mutate(source = factor(source,
+                               levels = model_type_levels,
+                               labels = model_type_labels))
+
+    annotation_data <- data.frame(
+        source = factor(c("Model"),
+                        levels = model_type_labels),
+        x = c(43),
+        y = c(0.8),
+        latex_label = c(model_formula)
+    )
+
+    r2_annotation_data <- data.frame(
+        source = factor(c("Model"),
+                        levels = model_type_labels),
+        x = c(43),
+        y = c(0.64),
+        latex_label = c(model_r2)
+    )
+
+    annotation_data$latex_label <- sapply(annotation_data$latex_label,
+                                          function (x) { TeX(x, output = "character") })
+
+    r2_annotation_data$latex_label <- sapply(r2_annotation_data$latex_label,
+                                             function (x) { TeX(x, output = "character") })
+
+    gpus_plot <- ggplot(pred_long, aes(x = gpus, y = prediction)) +
+        # geom_line(aes(group = interaction(source, ubatch), color = factor(ubatch)),
+        #           alpha = line_alpha, linewidth = line_width) +
+        # geom_point(aes(color = factor(ubatch)),
+        #            alpha = point_alpha, size = point_size) +
+        geom_hline(yintercept = reference_line_value,
+                   linetype = reference_line_type,
+                   color = reference_line_color) +
+        geom_point(data = df |>
+                       filter(type == "model") |>
+                       mutate(source = factor(type,
+                                              levels = c("model"),
+                                              labels = model_type_labels)),
+                   aes(x = gpus,
+                       y = as.numeric(coef),
+                       color = factor(ubatch)),
+                   # shape = 18,
+                   # width = 2,
+                   # height = 0,
+                   alpha = point_alpha,
+                   size = point_size,
+                   show.legend = TRUE) +
+        geom_line(data = df |>
+                      filter(type == "model") |>
+                      mutate(source = factor(type,
+                                             levels = c("model"),
+                                             labels = model_type_labels)),
+                  aes(x = gpus,
+                      y = as.numeric(coef),
+                      color = factor(ubatch)),
+                  alpha = line_alpha,
+                  size = line_width,
+                  show.legend = TRUE) +
+        # geom_label(data = annotation_data,
+        #            aes(x = x,
+        #                y = y,
+        #                label = latex_label),
+        #            hjust = 0.04,
+        #            vjust = 0,
+        #            size = 5.5,
+        #            fill = "gray80",
+        #            alpha = 0.5,
+        #            label.padding = unit(0.4, "lines"),
+        #            label.r = unit(0.2, "lines"),
+        #            label.size = 0,
+        #            parse = TRUE,
+        #            inherit.aes = FALSE) +
+        # geom_label(data = r2_annotation_data,
+        #            aes(x = x,
+        #                y = y,
+        #                label = latex_label),
+        #            hjust = 0.04,
+        #            vjust = 0,
+        #            size = 5.5,
+        #            fill = "gray80",
+        #            alpha = 0.5,
+        #            label.padding = unit(0.4, "lines"),
+        #            label.r = unit(0.2, "lines"),
+        #            label.size = 0,
+        #            parse = TRUE,
+        #            inherit.aes = FALSE) +
+        #scale_color_distiller(name = "Batch", palette = color_palette, trans = "log2") +
+        scale_color_brewer(name = "Batch", palette = color_palette) +
+        # scale_x_continuous(trans = "log2",
+        #                    breaks = scales::breaks_log(n = 5)) +
+        labs(
+            x = x_label_gpus,
+            y = y_label
+        ) +
+        theme_bw(base_size = plot_base_size) +
+        theme(
+            #legend.background = element_rect(fill = rgb(0, 0, 0, 0.13)),
+            legend.title = element_text(size = 14),
+            legend.direction = "horizontal",
+            legend.position = c(0.8, 0.15),
+            strip.background = element_rect(fill = "white"),
+        )
+
+    final_plot <- gpus_plot
+    ggsave(output_file, final_plot, width = output_width, height = output_height)
+
+    return()
+}
+
+ratio_df_table_publication <- function(ratio_df) {
+    ratio_df |>
+        filter(type == "model", ubatch <= 2) |>
+        mutate(is_multinode = gpus > 8) |>
+        group_by(ubatch, is_multinode) |>
+        summarize(stat_coef = median(as.numeric(coef)))
+}
+
+performance_comparison_publication_A100 <- function(input_file = "results/sc25/simulation_results/performance_ratios_A100_factorial_expanded.csv",
+                                                    output_file_batch_1_2_1_node = "results/sc25/figures/comparison_A100_batch_1_2_1_node.pdf",
+                                                    output_file_batch_1_2_multi_node = "results/sc25/figures/comparison_A100_batch_1_2_multi_node.pdf",
+                                                    output_file_batch_4_8 = "results/sc25/figures/comparison_A100_batch_4_8.pdf",
+                                                    width = 12,
+                                                    height = 8) {
+    plot_base_size <- 14
+
+    df <- read_csv(input_file)
+
+    ground_truth <- df %>%
+        filter(type == "real") %>%
+        select(gpus, ubatch, reference = total_time_ms, total_time_ms_ci)
+
+    plot_data <- df %>%
+        filter(type %in% c("roofline", "profiling", "model")) %>%
+        left_join(ground_truth, by = c("gpus", "ubatch", "total_time_ms_ci")) %>%
+        select(ubatch, gpus, type, total_time_ms, total_time_ms_ci, reference) %>%
+        mutate(
+            ubatch = factor(ubatch,
+                            levels = c("1", "2", "4", "8"),
+                            labels = c("Batch 1", "Batch 2", "Batch 4", "Batch 8")),
+            gpus = factor(gpus,
+                          levels = c("1", "2", "4", "8", "16",
+                                     "32", "64", "128"),
+                          labels = c("1 GPU", "2 GPUs", "4 GPUs", "8 GPUs",
+                                     "16 GPUs", "32 GPUs", "64 GPUs", "128 GPUs")),
+            type = factor(type,
+                          levels = c("roofline", "profiling", "model"),
+                          labels = c("roofline", "profiler", "model"))
+        )
+
+    ground_truth_formatted <- ground_truth %>%
+        mutate(
+            ubatch = factor(ubatch,
+                            levels = c("1", "2", "4", "8"),
+                            labels = c("Batch 1", "Batch 2", "Batch 4", "Batch 8")),
+            gpus = factor(gpus,
+                          levels = c("1", "2", "4", "8",
+                                     "16", "32", "64", "128"),
+                          labels = c("1 GPU", "2 GPUs", "4 GPUs", "8 GPUs",
+                                     "16 GPUs", "32 GPUs", "64 GPUs", "128 GPUs")),
+            )
+
+    p_ubatch_1_2_1_node <- ggplot() +
+        geom_rect(
+            data = ground_truth_formatted |>
+                filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                       gpus == "1 GPU" | gpus == "2 GPUs" | gpus == "4 GPUs" | gpus == "8 GPUs"),
+            aes(
+                xmin = -Inf,
+                xmax = Inf,
+                ymin = reference - total_time_ms_ci,
+                ymax = reference + total_time_ms_ci
+            ),
+            fill = "grey",
+            alpha = 0.6,
+            inherit.aes = FALSE
+        ) +
+        geom_hline(data = ground_truth_formatted |>
+                       filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                              gpus == "1 GPU" | gpus == "2 GPUs" | gpus == "4 GPUs" | gpus == "8 GPUs"),
+                   aes(yintercept = reference),
+                   linetype = "dashed",
+                   color = "black") +
+        geom_crossbar(data = plot_data |>
+                          filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                                 gpus == "1 GPU" | gpus == "2 GPUs" | gpus == "4 GPUs" | gpus == "8 GPUs"),
+                      aes(x = type,
+                          y = total_time_ms,
+                          ymin = total_time_ms - total_time_ms_ci,
+                          ymax = total_time_ms + total_time_ms_ci,
+                          color = type,
+                          fill = type),
+                      alpha = 0.6,
+                      width = 0.3) +
+        geom_text(data = ground_truth_formatted |>
+                      filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                             gpus == "1 GPU" | gpus == "2 GPUs" | gpus == "4 GPUs" | gpus == "8 GPUs"),
+                  aes(x = -Inf,
+                      y = Inf,
+                      label = paste0("Ground Truth: ", round(reference, 2))),
+                  hjust = -0.05,
+                  vjust = 1.5,
+                  size = 3,
+                  color = "black") +
+        geom_text(data = plot_data |>
+                  filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                         gpus == "1 GPU" | gpus == "2 GPUs" | gpus == "4 GPUs" | gpus == "8 GPUs"),
+                  aes(x = type,
+                      y = total_time_ms + total_time_ms_ci,
+                      color = type,
+                      label = round(total_time_ms, 2)),
+                  vjust = 1.5, size = 3.4) +
+        scale_color_brewer(palette = "Set1") +
+        scale_fill_brewer(palette = "Set1") +
+        guides(color = guide_legend(label = FALSE)) +
+        facet_grid(ubatch ~ gpus, scales = "free_y") +
+        labs(
+            x = "Simulation Method",
+            y = "Time (s)",
+        ) +
+        scale_y_continuous(expand = expansion(mult = c(0.25, 0.25))) +
+        theme_bw(base_size = plot_base_size) +
+        theme(
+            legend.position = "none",
+            strip.background = element_rect(fill = "white"),
+            plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+        )
+
+    p_ubatch_1_2_multi_node <- ggplot() +
+        geom_rect(
+            data = ground_truth_formatted |>
+                filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                       gpus != "1 GPU" & gpus != "2 GPUs" & gpus != "4 GPUs" & gpus != "8 GPUs"),
+            aes(
+                xmin = -Inf,
+                xmax = Inf,
+                ymin = reference - total_time_ms_ci,
+                ymax = reference + total_time_ms_ci
+            ),
+            fill = "grey",
+            alpha = 0.6,
+            inherit.aes = FALSE
+        ) +
+        geom_hline(data = ground_truth_formatted |>
+                       filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                              gpus != "1 GPU" & gpus != "2 GPUs" & gpus != "4 GPUs" & gpus != "8 GPUs"),
+                   aes(yintercept = reference),
+                   linetype = "dashed",
+                   color = "black") +
+        geom_crossbar(data = plot_data |>
+                          filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                                 gpus != "1 GPU" & gpus != "2 GPUs" & gpus != "4 GPUs" & gpus != "8 GPUs"),
+                      aes(x = type,
+                          y = total_time_ms,
+                          ymin = total_time_ms - total_time_ms_ci,
+                          ymax = total_time_ms + total_time_ms_ci,
+                          color = type,
+                          fill = type),
+                      alpha = 0.6,
+                      width = 0.3) +
+        geom_text(data = ground_truth_formatted |>
+                      filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                             gpus != "1 GPU" & gpus != "2 GPUs" & gpus != "4 GPUs" & gpus != "8 GPUs"),
+                  aes(x = -Inf,
+                      y = Inf,
+                      label = paste0("Ground Truth: ", round(reference, 2))),
+                  hjust = -0.05,
+                  vjust = 1.5,
+                  size = 3,
+                  color = "black") +
+        geom_text(data = plot_data |>
+                      filter(ubatch == "Batch 1" | ubatch == "Batch 2",
+                             gpus != "1 GPU" & gpus != "2 GPUs" & gpus != "4 GPUs" & gpus != "8 GPUs"),
+                  aes(x = type,
+                      y = total_time_ms + total_time_ms_ci,
+                      color = type,
+                      label = round(total_time_ms, 2)),
+                  vjust = 1.5, size = 3.4) +
+        scale_color_brewer(palette = "Set1") +
+        scale_fill_brewer(palette = "Set1") +
+        guides(color = guide_legend(label = FALSE)) +
+        facet_grid(ubatch ~ gpus, scales = "free_y") +
+        labs(
+            x = "Simulation Method",
+            y = "Time (s)",
+        ) +
+        scale_y_continuous(expand = expansion(mult = c(0.25, 0.25))) +
+        theme_bw(base_size = plot_base_size) +
+        theme(
+            legend.position = "none",
+            strip.background = element_rect(fill = "white"),
+            plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+        )
+
+
+    p_ubatch_4_8 <- ggplot() +
+        geom_rect(
+            data = ground_truth_formatted |> filter(ubatch == "Batch 8" | ubatch == "Batch 4"),
+            aes(
+                xmin = -Inf,
+                xmax = Inf,
+                ymin = reference - total_time_ms_ci,
+                ymax = reference + total_time_ms_ci
+            ),
+            fill = "grey",
+            alpha = 0.6,
+            inherit.aes = FALSE
+        ) +
+        geom_hline(data = ground_truth_formatted |> filter(ubatch == "Batch 8" | ubatch == "Batch 4"),
+                   aes(yintercept = reference),
+                   linetype = "dashed",
+                   color = "black") +
+        geom_crossbar(data = plot_data |> filter(ubatch == "Batch 8" | ubatch == "Batch 4"),
+                      aes(x = type,
+                          y = total_time_ms,
+                          ymin = total_time_ms - total_time_ms_ci,
+                          ymax = total_time_ms + total_time_ms_ci,
+                          color = type,
+                          fill = type),
+                      alpha = 0.6,
+                      width = 0.3) +
+        geom_text(data = ground_truth_formatted |> filter(ubatch == "Batch 8" | ubatch == "Batch 4"),
+                  aes(x = -Inf,
+                      y = Inf,
+                      label = paste0("Ground Truth: ", round(reference, 2))),
+                  hjust = -0.05,
+                  vjust = 1.5,
+                  size = 3,
+                  color = "black") +
+        geom_text(data = plot_data |> filter(ubatch == "Batch 8" | ubatch == "Batch 4"),
+                  aes(x = type,
+                      y = total_time_ms + total_time_ms_ci,
+                      color = type,
+                      label = round(total_time_ms, 2)),
+                  vjust = 1.5, size = 3.4) +
+        scale_color_brewer(palette = "Set1") +
+        scale_fill_brewer(palette = "Set1") +
+        guides(color = guide_legend(label = FALSE)) +
+        facet_grid(ubatch ~ gpus, scales = "free_y") +
+        labs(
+            x = "Simulation Method",
+            y = "Time (s)",
+        ) +
+        scale_y_continuous(expand = expansion(mult = c(0.25, 0.25))) +
+        theme_bw() +
+        theme(
+            legend.position = "none",
+            strip.background = element_rect(fill = "white"),
+            plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+        )
+
+    dir.create(dirname(output_file_batch_1_2_1_node), showWarnings = FALSE, recursive = TRUE)
+    ggsave(output_file_batch_1_2_1_node, p_ubatch_1_2_1_node, width = width, height = height)
+
+    dir.create(dirname(output_file_batch_1_2_multi_node), showWarnings = FALSE, recursive = TRUE)
+    ggsave(output_file_batch_1_2_multi_node, p_ubatch_1_2_multi_node, width = width, height = height)
+
+    dir.create(dirname(output_file_batch_4_8), showWarnings = FALSE, recursive = TRUE)
+    ggsave(output_file_batch_4_8, p_ubatch_4_8, width = width / 2, height = height)
+
+    return()
+}
+
+performance_comparison_publication_H100 <- function(input_file = "results/sc25/simulation_results/performance_ratios_H100_factorial_expanded.csv",
+                                                    output_file_batch_1_2 = "results/sc25/figures/comparison_H100_batch_1_2.pdf",
+                                                    width = 12,
+                                                    height = 8) {
+    df <- read_csv(input_file)
+
+    ground_truth <- df %>%
+        filter(type == "real") %>%
+        select(gpus, ubatch, reference = total_time_ms, total_time_ms_ci)
+
+    plot_data <- df %>%
+        filter(type %in% c("roofline", "profiling", "model")) %>%
+        left_join(ground_truth, by = c("gpus", "ubatch", "total_time_ms_ci")) %>%
+        select(ubatch, gpus, type, total_time_ms, total_time_ms_ci, reference) %>%
+        mutate(
+            ubatch = factor(ubatch,
+                            levels = c("1", "2", "4", "8"),
+                            labels = c("Batch 1", "Batch 2", "Batch 4", "Batch 8")),
+            gpus = factor(gpus,
+                          levels = c("1", "2", "4", "8", "16",
+                                     "32", "64", "128"),
+                          labels = c("1 GPU", "2 GPUs", "4 GPUs", "8 GPUs",
+                                     "16 GPUs", "32 GPUs", "64 GPUs", "128 GPUs")),
+            type = factor(type,
+                          levels = c("roofline", "profiling", "model"),
+                          labels = c("roofline", "profiler", "model"))
+        )
+
+    ground_truth_formatted <- ground_truth %>%
+        mutate(
+            ubatch = factor(ubatch,
+                            levels = c("1", "2", "4", "8"),
+                            labels = c("Batch 1", "Batch 2", "Batch 4", "Batch 8")),
+            gpus = factor(gpus,
+                          levels = c("1", "2", "4", "8",
+                                     "16", "32", "64", "128"),
+                          labels = c("1 GPU", "2 GPUs", "4 GPUs", "8 GPUs",
+                                     "16 GPUs", "32 GPUs", "64 GPUs", "128 GPUs")),
+            )
+
+    p_ubatch_1_2 <- ggplot() +
+        geom_rect(
+            data = ground_truth_formatted |> filter(ubatch == "Batch 1" | ubatch == "Batch 2"),
+            aes(
+                xmin = -Inf,
+                xmax = Inf,
+                ymin = reference - total_time_ms_ci,
+                ymax = reference + total_time_ms_ci
+            ),
+            fill = "grey",
+            alpha = 0.6,
+            inherit.aes = FALSE
+        ) +
+        geom_hline(data = ground_truth_formatted |> filter(ubatch == "Batch 1" | ubatch == "Batch 2"),
+                   aes(yintercept = reference),
+                   linetype = "dashed",
+                   color = "black") +
+        geom_crossbar(data = plot_data |> filter(ubatch == "Batch 1" | ubatch == "Batch 2"),
+                      aes(x = type,
+                          y = total_time_ms,
+                          ymin = total_time_ms - total_time_ms_ci,
+                          ymax = total_time_ms + total_time_ms_ci,
+                          color = type,
+                          fill = type),
+                      alpha = 0.6,
+                      width = 0.3) +
+        geom_text(data = ground_truth_formatted |> filter(ubatch == "Batch 1" | ubatch == "Batch 2"),
+                  aes(x = -Inf,
+                      y = Inf,
+                      label = paste0("Ground Truth: ", round(reference, 2))),
+                  hjust = -0.05,
+                  vjust = 1.5,
+                  size = 3,
+                  color = "black") +
+        geom_text(data = plot_data |> filter(ubatch == "Batch 1" | ubatch == "Batch 2"),
+                  aes(x = type,
+                      y = total_time_ms + total_time_ms_ci,
+                      color = type,
+                      label = round(total_time_ms, 2)),
+                  vjust = 1.5, size = 3.4) +
+        scale_color_brewer(palette = "Set1") +
+        scale_fill_brewer(palette = "Set1") +
+        guides(color = guide_legend(label = FALSE)) +
+        facet_grid(ubatch ~ gpus, scales = "free_y") +
+        labs(
+            x = "Simulation Method",
+            y = "Time (s)",
+        ) +
+        scale_y_continuous(expand = expansion(mult = c(0.25, 0.25))) +
+        theme_bw(base_size = 14) +
+        theme(
+            legend.position = "none",
+            strip.background = element_rect(fill = "white"),
+            plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+        )
+
+    dir.create(dirname(output_file_batch_1_2), showWarnings = FALSE, recursive = TRUE)
+    ggsave(output_file_batch_1_2, p_ubatch_1_2, width = width, height = height)
+
+    return()
+}
+#+END_SRC
+
+#+RESULTS:
+
+*** Load and format data
+#+BEGIN_SRC R :tangle generate_plots.R
+# Find and load simulation files
+all_files <- find_all_files(
+    path = "results/sc25/astra_sim_measurements/A100_factorial_expanded",
+    pattern = "EndToEnd.csv"
+)
+
+# Load files in batches
+df_sim_full <- load_files_in_batches(all_files, batch_size = 500)
+
+# Format simulation data
+df_sim <- format_simulation_data(df_sim_full)
+
+# Load and format real data
+df_real <- load_and_format_real_data(list(
+    path = "results/lit-llama/block-activation-checkpointing/",
+    pattern = "A100"
+))
+
+# Combine, adjust and save the data
+df <- adjust_data_and_save(
+    df_sim,
+    df_real,
+    "results/sc25/astra_sim_measurements/aggregated_A100_factorial_expanded.csv"
+)
+#+END_SRC
+
+*** Finding the best delay ratio and plotting coefficient models
+**** Full simplified code
+#+BEGIN_SRC R :tangle generate_plots.R
+df <- load_performance_data("results/sc25/astra_sim_measurements/aggregated_A100_factorial_expanded.csv")
+
+ref_df <- create_reference_dataframe(df)
+
+ratio_df <- calculate_performance_ratios(df, ref_df)
+save_and_print_ratios(ratio_df, "results/sc25/simulation_results/performance_ratios_A100_factorial_expanded.csv")
+print(ratio_df, n = Inf)
+
+# Fitting coefficient curve for models
+ratio_df <- load_performance_data("results/sc25/simulation_results/performance_ratios_A100_factorial_expanded.csv")
+df_lm_model <- prepare_model_data(ratio_df, "model", 1)
+model_fit <- fit_coefficient_model(df_lm_model)
+
+# Fitting coefficient curve for profiling
+df_lm_profiling <- prepare_model_data(ratio_df, "profiling", 1)
+profiling_fit <- fit_coefficient_model(df_lm_profiling)
+
+coefficient_trend_plots_publication(
+    input_file = "results/sc25/simulation_results/performance_ratios_A100_factorial_expanded.csv",
+    output_file = "results/sc25/figures/coefficient_faceted_trends_A100_factorial_expanded_publication.pdf",
+    grid_size = 32,
+    max_ubatch = 2,
+    max_gpus = 128,
+    output_width = 8,
+    output_height = 3.5
+)
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+# A tibble: 96 × 9
+   type   gpus ubatch coef  total_time_ms total_time_ms_ci ref_time ratio_time_ms abs_diff_ratio
+   <chr> <dbl>  <dbl> <chr>         <dbl>            <dbl>    <dbl>         <dbl>          <dbl>
+ 1 model     1      1 0.6           0.961          0.0123     0.869         1.11       0.106
+ 2 model     1      2 0.8           1.56           0.0146     1.55          1.00       0.00201
+ 3 model     1      4 1             2.89           0.0278     2.93          0.988      0.0121
+ 4 model     1      8 1             5.47           0.0489     5.64          0.970      0.0300
+ 5 model   128      1 1.2           1.85           0.0113     1.82          1.01       0.0142
+ 6 model   128      2 1.2           2.35           0.0150     2.29          1.03       0.0270
+ 7 model    16      1 0.9           1.38           0.00947    1.36          1.02       0.0167
+ 8 model    16      2 1             1.89           0.0108     1.83          1.04       0.0364
+ 9 model     2      1 0.7           1.05           0.0103     1.05          0.999      0.000945
+10 model     2      2 0.9           1.80           0.0200     1.80          1.00       0.0000350
+# ℹ 86 more rows
+# ℹ Use `print(n = ...)` to see more rows
+# A tibble: 96 × 9
+   type       gpus ubatch coef  total_time_ms total_time_ms_ci ref_time ratio_time_ms abs_diff_ratio
+   <chr>     <dbl>  <dbl> <chr>         <dbl>            <dbl>    <dbl>         <dbl>          <dbl>
+ 1 model         1      1 0.6           0.961        0.0123       0.869         1.11       0.106
+ 2 model         1      2 0.8           1.56         0.0146       1.55          1.00       0.00201
+ 3 model         1      4 1             2.89         0.0278       2.93          0.988      0.0121
+ 4 model         1      8 1             5.47         0.0489       5.64          0.970      0.0300
+ 5 model       128      1 1.2           1.85         0.0113       1.82          1.01       0.0142
+ 6 model       128      2 1.2           2.35         0.0150       2.29          1.03       0.0270
+ 7 model        16      1 0.9           1.38         0.00947      1.36          1.02       0.0167
+ 8 model        16      2 1             1.89         0.0108       1.83          1.04       0.0364
+ 9 model         2      1 0.7           1.05         0.0103       1.05          0.999      0.000945
+10 model         2      2 0.9           1.80         0.0200       1.80          1.00       0.0000350
+11 model         2      4 1.2           3.41         0.0445       3.37          1.01       0.0120
+12 model         2      8 1.2           6.72         0.0328       6.44          1.04       0.0438
+13 model        32      1 1             1.57         0.00713      1.61          0.977      0.0231
+14 model        32      2 1.1           2.12         0.0155       2.08          1.02       0.0191
+15 model         4      1 0.6           0.963        0.00884      1.00          0.960      0.0402
+16 model         4      2 0.9           1.77         0.0140       1.74          1.02       0.0204
+17 model         4      4 1.2           3.30         0.0304       3.27          1.01       0.00861
+18 model         4      8 1.1           6.50         0.0564       6.28          1.04       0.0351
+19 model        64      1 1.1           1.76         0.00822      1.74          1.02       0.0154
+20 model        64      2 1.2           2.23         0.0168       2.21          1.01       0.00915
+21 model         8      1 0.6           0.976        0.00689      1.04          0.942      0.0581
+22 model         8      2 0.9           1.71         0.0121       1.75          0.976      0.0235
+23 model         8      4 1.2           3.44         0.0374       3.34          1.03       0.0298
+24 model         8      8 1.1           6.43         0.0362       6.17          1.04       0.0429
+25 profiling     1      1 1.1           0.847        0.000126     0.869         0.975      0.0254
+26 profiling     1      2 1.1           1.61         0.00208      1.55          1.04       0.0385
+27 profiling     1      4 0.9           2.81         0.00165      2.93          0.961      0.0390
+28 profiling     1      8 0.9           5.60         0.00622      5.64          0.992      0.00829
+29 profiling   128      1 2.1           1.64         0.000137     1.82          0.898      0.102
+30 profiling   128      2 1.5           2.23         0.00223      2.29          0.975      0.0254
+31 profiling    16      1 1.6           1.25         0.000125     1.36          0.924      0.0761
+32 profiling    16      2 1.2           1.79         0.00179      1.83          0.978      0.0224
+33 profiling     2      1 1.4           1.08         0.000147     1.05          1.03       0.0285
+34 profiling     2      2 1.2           1.76         0.00221      1.80          0.978      0.0219
+35 profiling     2      4 1.1           3.42         0.00349      3.37          1.02       0.0155
+36 profiling     2      8 1.0           6.18         0.00462      6.44          0.960      0.0402
+37 profiling    32      1 2.1           1.63         0.000140     1.61          1.01       0.0121
+38 profiling    32      2 1.4           2.08         0.00221      2.08          0.999      0.000552
+39 profiling     4      1 1.3           1.02         0.0000956    1.00          1.02       0.0164
+40 profiling     4      2 1.2           1.78         0.00312      1.74          1.02       0.0249
+41 profiling     4      4 1.0           3.12         0.00182      3.27          0.954      0.0459
+42 profiling     4      8 1.0           6.18         0.00725      6.28          0.983      0.0168
+43 profiling    64      1 2.1           1.64         0.000261     1.74          0.942      0.0579
+44 profiling    64      2 1.5           2.22         0.00195      2.21          1.01       0.00678
+45 profiling     8      1 1.3           1.03         0.000115     1.04          0.995      0.00506
+46 profiling     8      2 1.2           1.78         0.00192      1.75          1.01       0.0140
+47 profiling     8      4 1.1           3.44         0.00209      3.34          1.03       0.0297
+48 profiling     8      8 1.0           6.21         0.00734      6.17          1.01       0.00764
+49 roofline      1      1 no            0.569        0            0.869         0.655      0.345
+50 roofline      1      2 no            1.11         0            1.55          0.717      0.283
+51 roofline      1      4 no            2.21         0            2.93          0.753      0.247
+52 roofline      1      8 no            4.39         0            5.64          0.778      0.222
+53 roofline    128      1 no            0.736        0            1.82          0.403      0.597
+54 roofline    128      2 no            1.28         0            2.29          0.559      0.441
+55 roofline     16      1 no            0.669        0            1.36          0.492      0.508
+56 roofline     16      2 no            1.21         0            1.83          0.663      0.337
+57 roofline      2      1 no            0.618        0            1.05          0.588      0.412
+58 roofline      2      2 no            1.16         0            1.80          0.645      0.355
+59 roofline      2      4 no            2.25         0            3.37          0.667      0.333
+60 roofline      2      8 no            4.42         0            6.44          0.687      0.313
+61 roofline     32      1 no            0.678        0            1.61          0.420      0.580
+62 roofline     32      2 no            1.22         0            2.08          0.588      0.412
+63 roofline      4      1 no            0.645        0            1.00          0.643      0.357
+64 roofline      4      2 no            1.19         0            1.74          0.684      0.316
+65 roofline      4      4 no            2.27         0            3.27          0.694      0.306
+66 roofline      4      8 no            4.45         0            6.28          0.708      0.292
+67 roofline     64      1 no            0.696        0            1.74          0.401      0.599
+68 roofline     64      2 no            1.24         0            2.21          0.561      0.439
+69 roofline      8      1 no            0.659        0            1.04          0.636      0.364
+70 roofline      8      2 no            1.20         0            1.75          0.686      0.314
+71 roofline      8      4 no            2.29         0            3.34          0.685      0.315
+72 roofline      8      8 no            4.46         0            6.17          0.723      0.277
+73 real        128      1 NA            1.82         0.00194      1.82          1          0
+74 real        128      2 NA            2.29         0.00461      2.29          1          0
+75 real         16      1 NA            1.36         0.00181      1.36          1          0
+76 real         16      2 NA            1.83         0.00552      1.83          1          0
+77 real          1      1 NA            0.869        0.0144       0.869         1          0
+78 real          1      2 NA            1.55         0.0103       1.55          1          0
+79 real          1      4 NA            2.93         0.00911      2.93          1          0
+80 real          1      8 NA            5.64         0.00642      5.64          1          0
+81 real          2      1 NA            1.05         0.0359       1.05          1          0
+82 real          2      2 NA            1.80         0.0318       1.80          1          0
+83 real          2      4 NA            3.37         0.0243       3.37          1          0
+84 real          2      8 NA            6.44         0.0126       6.44          1          0
+85 real         32      1 NA            1.61         0.00274      1.61          1          0
+86 real         32      2 NA            2.08         0.00357      2.08          1          0
+87 real          4      1 NA            1.00         0.0352       1.00          1          0
+88 real          4      2 NA            1.74         0.0301       1.74          1          0
+89 real          4      4 NA            3.27         0.0301       3.27          1          0
+90 real          4      8 NA            6.28         0.0267       6.28          1          0
+91 real         64      1 NA            1.74         0.00341      1.74          1          0
+92 real         64      2 NA            2.21         0.00803      2.21          1          0
+93 real          8      1 NA            1.04         0.0739       1.04          1          0
+94 real          8      2 NA            1.75         0.0401       1.75          1          0
+95 real          8      4 NA            3.34         0.0741       3.34          1          0
+96 real          8      8 NA            6.17         0.0451       6.17          1          0
+
+Call:
+lm(formula = formula_str, data = df_lm)
+
+Residuals:
+     Min       1Q   Median       3Q      Max
+-0.08243 -0.02814 -0.01053  0.02793  0.12836
+
+Coefficients:
+            Estimate Std. Error t value Pr(>|t|)
+(Intercept)  2.40869    0.43059   5.594 0.000162 ***
+log(ubatch) -0.52289    0.17780  -2.941 0.013425 *
+log(gpus)    0.08280    0.02397   3.454 0.005386 **
+I(1/ubatch) -2.49953    0.64114  -3.899 0.002483 **
+I(1/gpus)    0.01064    0.09094   0.117 0.908926
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Residual standard error: 0.0662 on 11 degrees of freedom
+Multiple R-squared:  0.8263,	Adjusted R-squared:  0.7631
+F-statistic: 13.08 on 4 and 11 DF,  p-value: 0.0003657
+
+Call:
+lm(formula = formula_str, data = df_lm)
+
+Residuals:
+      Min        1Q    Median        3Q       Max
+-0.107524 -0.043831  0.000835  0.036035  0.105404
+
+Coefficients:
+            Estimate Std. Error t value Pr(>|t|)
+(Intercept)  0.60732    0.41684   1.457  0.17307
+log(ubatch)  0.06812    0.17212   0.396  0.69986
+log(gpus)    0.09376    0.02320   4.041  0.00195 **
+I(1/ubatch)  0.77772    0.62066   1.253  0.23617
+I(1/gpus)    0.06685    0.08803   0.759  0.46358
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Residual standard error: 0.06409 on 11 degrees of freedom
+Multiple R-squared:  0.9162,	Adjusted R-squared:  0.8858
+F-statistic: 30.08 on 4 and 11 DF,  p-value: 7.207e-06
+NULL
+NULL
+# A tibble: 2 × 1
+  ubatch
+   <dbl>
+1      1
+2      2
+
+Call:
+lm(formula = coef ~ (log(ubatch) + log(gpus)), data = filter(df,
+    type == "model"))
+
+Residuals:
+     Min       1Q   Median       3Q      Max
+-0.19970 -0.04390  0.01905  0.05476  0.09792
+
+Coefficients:
+            Estimate Std. Error t value Pr(>|t|)
+(Intercept)  0.57292    0.04535  12.633 1.13e-08 ***
+log(ubatch)  0.23444    0.06286   3.730  0.00252 **
+log(gpus)    0.10906    0.01372   7.951 2.39e-06 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Residual standard error: 0.08714 on 13 degrees of freedom
+Multiple R-squared:  0.8558,	Adjusted R-squared:  0.8336
+F-statistic: 38.56 on 2 and 13 DF,  p-value: 3.422e-06
+
+NULL
+#+end_example
+
+*** Comparing accuracies (scatter)
+**** Plot
+#+BEGIN_SRC R :tangle generate_plots.R
+performance_comparison_publication_A100(width = 10,
+                                        height = 3)
+
+performance_comparison_publication_H100(width = 10,
+                                        height = 4)
+#+END_SRC
+
+#+RESULTS:
+: NULL
+: NULL
+: NULL
+
+*** Tables
+**** Kernel Space
+#+BEGIN_SRC python :tangle generate_plots.py
+import subprocess
+import os
+import math
+
+def generate_parameter_table(kernel_parameters, output_dir=".", filename="kernel_parameters",
+                             show_full_range=False, show_decimals=False, use_math_interval=True):
+    """
+    Generate a compact LaTeX table from a dictionary of kernel parameters,
+    including cumulative search space size.
+
+    Args:
+        kernel_parameters: Dictionary with parameter names as keys and lists of values as values
+        output_dir: Directory to save the output files (default: current directory)
+        filename: Base name for the output files (default: kernel_parameters)
+        show_full_range: Whether to show all values or just min/max (default: False)
+        show_decimals: Whether to show decimal equivalents for powers of 2 (default: False)
+        use_math_interval: Whether to use mathematical interval notation [low, high] (default: True)
+
+    Returns:
+        Path to the generated PDF file
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Calculate the cumulative search space sizes
+    param_names = list(kernel_parameters.keys())
+    cumulative_sizes = []
+    cumulative_product = 1
+
+    for param in param_names:
+        cumulative_product *= len(kernel_parameters[param])
+        cumulative_sizes.append(cumulative_product)
+
+    # Start LaTeX document - with tighter borders and better table fitting
+    latex_lines = [
+        "\\documentclass[border=5pt,varwidth]{standalone}",
+        "\\usepackage{booktabs}",
+        "\\usepackage{array}",
+        "\\usepackage{amsmath}",
+        "\\usepackage{siunitx}",  # For scientific notation
+        "\\usepackage[table]{xcolor}",
+        "\\begin{document}",
+        "",
+        "\\begin{tabular}{llr}",  # Added third column for search space size
+        "\\toprule",
+        "\\textbf{Parameter} & \\textbf{Values} & \\textbf{Cummulative Space} \\\\",
+        "\\midrule"
+    ]
+
+    # Function to format large numbers in scientific notation
+    def format_scientific(number):
+        if number < 1000:
+            return str(number)  # Small numbers as integers
+        exponent = math.floor(math.log10(number))
+        mantissa = number / (10 ** exponent)
+        # Fixed - using proper f-string syntax
+        return f"${mantissa:.2f} \\times 10^{{{exponent}}}$"
+
+    # Add rows for each parameter
+    for i, param in enumerate(param_names):
+        values = sorted(kernel_parameters[param])
+
+        # Check if all values are powers of 2
+        is_power_of_2 = all(val & (val-1) == 0 and val > 0 for val in values)
+
+        # Determine which values to show based on show_full_range
+        if not show_full_range and len(values) > 2:
+            display_values = [min(values), max(values)]
+        else:
+            display_values = values
+
+        if is_power_of_2:
+            # Get exponents for the values to display
+            exponents = [int.bit_length(val) - 1 for val in display_values]
+
+            if show_full_range:
+                # Show all values (with compact formatting)
+                if show_decimals:
+                    formatted_values = ", ".join([f"$2^{{{exp}}}\\!=\\!{2**exp}$" for exp in exponents])
+                else:
+                    formatted_values = ", ".join([f"$2^{{{exp}}}$" for exp in exponents])
+            else:
+                # Show min/max only
+                if len(exponents) == 1:
+                    # Only one value
+                    if show_decimals:
+                        formatted_values = f"$2^{{{exponents[0]}}}\\!=\\!{2**exponents[0]}$"
+                    else:
+                        formatted_values = f"$2^{{{exponents[0]}}}$"
+                else:
+                    # Min and max values
+                    if use_math_interval:
+                        if show_decimals:
+                            formatted_values = f"$[2^{{{exponents[0]}}}\\!=\\!{2**exponents[0]}," + \
+                                              f"2^{{{exponents[-1]}}}\\!=\\!{2**exponents[-1]}]$"
+                        else:
+                            formatted_values = f"$[2^{{{exponents[0]}}},2^{{{exponents[-1]}}}]$"
+                    else:
+                        if show_decimals:
+                            formatted_values = f"$2^{{{exponents[0]}}}\\!=\\!{2**exponents[0]}$ to " + \
+                                              f"$2^{{{exponents[-1]}}}\\!=\\!{2**exponents[-1]}$"
+                        else:
+                            formatted_values = f"$2^{{{exponents[0]}}}$ to $2^{{{exponents[-1]}}}$"
+        else:
+            # For non-powers of 2
+            if not show_full_range and len(display_values) > 1:
+                if use_math_interval:
+                    formatted_values = f"$[{display_values[0]},{display_values[-1]}]$"
+                else:
+                    formatted_values = f"{display_values[0]} to {display_values[-1]}"
+            else:
+                formatted_values = ", ".join([str(v) for v in display_values])
+
+        # Escape underscores in parameter names
+        param_escaped = param.replace("_", "\\_")
+
+        # Format cumulative search space size
+        search_space = format_scientific(cumulative_sizes[i])
+
+        # Add row to table with search space size
+        latex_lines.append(f"{param_escaped} & {formatted_values} & {search_space} \\\\")
+
+    # Finish the table and document
+    latex_lines.extend([
+        "\\bottomrule",
+        "\\end{tabular}",
+        "",
+        "\\end{document}"
+    ])
+
+    # Write LaTeX content to file
+    tex_file = os.path.join(output_dir, f"{filename}.tex")
+    with open(tex_file, "w") as f:
+        f.write("\n".join(latex_lines))
+
+    # Compile LaTeX to PDF
+    try:
+        subprocess.run(["pdflatex", "-output-directory", output_dir, tex_file],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Clean up auxiliary files
+        for ext in [".aux", ".log"]:
+            aux_file = os.path.join(output_dir, f"{filename}{ext}")
+            if os.path.exists(aux_file):
+                os.remove(aux_file)
+
+        print(f"PDF generated and saved to {os.path.join(output_dir, filename)}.pdf")
+        return os.path.join(output_dir, f"{filename}.pdf")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error generating PDF: {e}")
+        return None
+
+# Example usage
+kernel_parameters = {
+    "batch": [2**i for i in range(0, 8)],  # 1 to 128
+    "max_seq_length": [2**i for i in range(8, 15)],  # 256 to 16384
+    "n_embed": [2**i for i in range(10, 15)],  # 1024 to 16384
+    "n_head": [2**i for i in range(3, 8)],  # 8 to 128
+    "tensor_parallelism": [2**i for i in range(0, 4)],  # 1 to 8
+}
+
+generate_parameter_table(kernel_parameters, "results/sc25/figures", "kernel_params")
+#+END_SRC
+
+#+RESULTS:
+: PDF generated and saved to results/sc25/figures/kernel_params.pdf
+
+**** Model Results
+#+BEGIN_SRC R :tangle generate_plots.R
+library(readr)
+
+df = read_csv("results/sc25/model_training_summary/a100_mean_factorial_expanded_specific/all_kernels_model_evaluation.csv",
+              show_col_types = FALSE) |>
+    filter(gpu == "a100_mean_factorial_expanded") |>
+    mutate(gpu = "A100")
+#+END_SRC
+
+#+RESULTS:
+
+***** Improved table
+#+BEGIN_SRC R :tangle generate_plots.R
+library(tidyverse)
+library(knitr)
+
+# Function to format scientific notation with proper LaTeX escaping
+format_scientific_latex <- function(x, digits = 2) {
+  if(is.na(x) || is.null(x)) return("NA")
+
+  # Parse the number into mantissa and exponent
+  exponent <- floor(log10(abs(x)))
+  mantissa <- x / 10^exponent
+
+  # Round mantissa to specified digits
+  mantissa <- round(mantissa, digits)
+
+  # Format as LaTeX with DOUBLE escaping for backslashes
+  return(sprintf("$%.2f \\times 10^{%d}$", mantissa, exponent))
+}
+
+# Create the formatted dataframe
+df_formatted <- df %>%
+  # Create combined y range column with properly escaped LaTeX math symbols
+  mutate(test_y_range = sprintf("$y \\in [%.5f, %.5f], \\mu = %.5f$",
+                               min_test_y, max_test_y, mean_test_y),
+         out_of_confidence_pct = out_of_confidence * 100,
+         lin_reg_RMSE_formatted = sapply(lin_reg_RMSE, format_scientific_latex),
+         MAE_formatted = sapply(MAE, format_scientific_latex),
+         RMSE_formatted = sapply(RMSE, format_scientific_latex),
+         name = gsub("_", "\\\\_", name)) %>%
+  # Select and arrange columns - grouping similar metrics together
+  select(name, gpu,
+         R2, lin_reg_R2,
+         RMSE_formatted, lin_reg_RMSE_formatted,
+         out_of_confidence_pct,
+         test_y_range)
+
+# Create a simple LaTeX table manually without using kable
+latex_rows <- apply(df_formatted, 1, function(row) {
+  sprintf("%s & %s & %.4f & %.4f & %s & %s & %.4f & %s \\\\",
+          row["name"], row["gpu"],
+          as.numeric(row["R2"]), as.numeric(row["lin_reg_R2"]),
+          row["RMSE_formatted"], row["lin_reg_RMSE_formatted"],
+          as.numeric(row["out_of_confidence_pct"]),
+          row["test_y_range"])
+})
+
+# Create complete LaTeX document (figure-style)
+latex_document <- c(
+  "\\documentclass[border=10pt]{standalone}",
+  "\\usepackage{booktabs}",
+  "\\usepackage{array}",
+  "\\usepackage{amsmath}",
+  "\\usepackage[table]{xcolor}",
+  "\\begin{document}",
+  "",
+  "\\begin{tabular}{llrrrrrr}",
+  "\\toprule",
+  "\\textbf{Kernel} & \\textbf{GPU} & \\textbf{R$^2$} & \\textbf{Lin. Reg. R$^2$} & \\textbf{RMSE} & \\textbf{Lin. Reg. RMSE} & \\textbf{OOC (\\%)} & \\textbf{Test} $y$ \\textbf{Range} \\\\",
+  "\\midrule",
+  latex_rows,
+  "\\bottomrule",
+  "\\end{tabular}",
+  "",
+  "\\end{document}"
+)
+
+# Write to file
+writeLines(paste(latex_document, collapse = "\n"), "results/sc25/figures/tmp_table_A100_factorial_expanded.tex")
+
+# Now compile to PDF and move to the figures directory
+system("pdflatex -output-directory=results/sc25/figures results/sc25/figures/tmp_table_A100_factorial_expanded.tex")
+system("mv results/sc25/figures/tmp_table_A100_factorial_expanded.pdf results/sc25/figures/model_performance_table_A100_factorial_expanded.pdf")
+system("rm results/sc25/figures/tmp_table_A100_factorial_expanded.aux")
+
+cat("PDF generated and saved to results/sc25/figures/model_performance_table_A100_factorial_expanded.pdf\n")
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2025/dev/Debian) (preloaded format=pdflatex)
+ restricted \write18 enabled.
+entering extended mode
+(./results/sc25/figures/tmp_table_A100_factorial_expanded.tex
+LaTeX2e <2024-11-01> patch level 1
+L3 programming layer <2024-12-25>
+(/usr/share/texlive/texmf-dist/tex/latex/standalone/standalone.cls
+Document Class: standalone 2022/10/10 v1.3b Class to compile TeX sub-files stan
+dalone
+(/usr/share/texlive/texmf-dist/tex/latex/tools/shellesc.sty)
+(/usr/share/texlive/texmf-dist/tex/generic/iftex/ifluatex.sty
+(/usr/share/texlive/texmf-dist/tex/generic/iftex/iftex.sty))
+(/usr/share/texlive/texmf-dist/tex/latex/xkeyval/xkeyval.sty
+(/usr/share/texlive/texmf-dist/tex/generic/xkeyval/xkeyval.tex
+(/usr/share/texlive/texmf-dist/tex/generic/xkeyval/xkvutils.tex
+(/usr/share/texlive/texmf-dist/tex/generic/xkeyval/keyval.tex))))
+(/usr/share/texlive/texmf-dist/tex/latex/standalone/standalone.cfg)
+(/usr/share/texlive/texmf-dist/tex/latex/base/article.cls
+Document Class: article 2024/06/29 v1.4n Standard LaTeX document class
+(/usr/share/texlive/texmf-dist/tex/latex/base/size10.clo)))
+(/usr/share/texlive/texmf-dist/tex/latex/booktabs/booktabs.sty)
+(/usr/share/texlive/texmf-dist/tex/latex/tools/array.sty)
+(/usr/share/texlive/texmf-dist/tex/latex/amsmath/amsmath.sty
+For additional information on amsmath, use the `?' option.
+(/usr/share/texlive/texmf-dist/tex/latex/amsmath/amstext.sty
+(/usr/share/texlive/texmf-dist/tex/latex/amsmath/amsgen.sty))
+(/usr/share/texlive/texmf-dist/tex/latex/amsmath/amsbsy.sty)
+(/usr/share/texlive/texmf-dist/tex/latex/amsmath/amsopn.sty))
+(/usr/share/texlive/texmf-dist/tex/latex/xcolor/xcolor.sty
+(/usr/share/texlive/texmf-dist/tex/latex/graphics-cfg/color.cfg)
+(/usr/share/texlive/texmf-dist/tex/latex/graphics-def/pdftex.def)
+(/usr/share/texlive/texmf-dist/tex/latex/graphics/mathcolor.ltx))
+(/usr/share/texlive/texmf-dist/tex/latex/colortbl/colortbl.sty)
+(/usr/share/texlive/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def)
+No file tmp_table_A100_factorial_expanded.aux.
+(/usr/share/texlive/texmf-dist/tex/context/base/mkii/supp-pdf.mkii
+[Loading MPS to PDF converter (version 2006.09.02).]
+)
+[1{/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map}]
+(results/sc25/figures/tmp_table_A100_factorial_expanded.aux) )</usr/share/texli
+ve/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb></usr/share/texlive/tex
+mf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></usr/share/texlive/texmf-dis
+t/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/share/texlive/texmf-dist/fonts
+/type1/public/amsfonts/cm/cmr7.pfb></usr/share/texlive/texmf-dist/fonts/type1/p
+ublic/amsfonts/cm/cmsy10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/
+amsfonts/cm/cmsy7.pfb>
+Output written on results/sc25/figures/tmp_table_A100_factorial_expanded.pdf (1
+ page, 64608 bytes).
+Transcript written on results/sc25/figures/tmp_table_A100_factorial_expanded.lo
+g.
+PDF generated and saved to results/sc25/figures/model_performance_table_A100_factorial_expanded.pdf
+#+end_example
+
+** The roofline model
+#+BEGIN_SRC R :tangle generate_plots.R
+library(tidyverse)
+library(scales)
+library(RColorBrewer)
+
+h100_specs <- tibble(
+    gpu = "NVIDIA H100",
+    peak_fp32_tflops = 989,
+    peak_fp32_standard_tflops = 67,
+    memory_bandwidth_gbs = 3350,
+    ridge_point_tensor = peak_fp32_tflops / memory_bandwidth_gbs,
+    ridge_point_standard = peak_fp32_standard_tflops / memory_bandwidth_gbs
+)
+
+ai_values <- tibble(
+    arithmetic_intensity = 10^seq(-4, 2.5, by = 0.05)
+)
+
+roofline_data <- ai_values %>%
+    mutate(
+        memory_bound_perf = arithmetic_intensity * h100_specs$memory_bandwidth_gbs,
+        compute_bound_tensor = h100_specs$peak_fp32_tflops,
+        compute_bound_standard = h100_specs$peak_fp32_standard_tflops,
+        attainable_perf_tensor = pmin(memory_bound_perf, compute_bound_tensor),
+        attainable_perf_standard = pmin(memory_bound_perf, compute_bound_standard)
+    )
+
+set1_colors <- brewer.pal(9, "Set1")[1:3]
+
+roofline_plot <- ggplot() +
+    geom_line(data = roofline_data |>
+                  filter(arithmetic_intensity <= h100_specs$ridge_point_tensor),
+              aes(x = arithmetic_intensity,
+                  y = memory_bound_perf,
+                  color = "Memory Bandwidth Limit"),
+              size = 1) +
+    geom_hline(aes(yintercept = h100_specs$peak_fp32_standard_tflops,
+                   color = "Standard FP32 Peak Performance"),
+               size = 1) +
+    geom_hline(aes(yintercept = h100_specs$peak_fp32_tflops,
+                   color = "Tensor Cores Peak Performance"),
+               size = 1) +
+    geom_point(data = h100_specs,
+               aes(x = ridge_point_standard,
+                   y = peak_fp32_standard_tflops,
+                   color = "Memory Bandwidth Limit"),
+               show.legend = FALSE,
+               size = 3) +
+    geom_point(data = h100_specs,
+               aes(x = ridge_point_tensor,
+                   y = peak_fp32_tflops,
+                   color = "Memory Bandwidth Limit"),
+               show.legend = FALSE,
+               size = 3) +
+    scale_x_log10(
+        breaks = 10^seq(-4, 5, 1),
+        labels = trans_format("log10", math_format(10^.x)),
+        limits = c(10^-2.5, 10^2.5)
+    ) +
+    scale_y_log10(
+        limits = c(20, 1200),
+        breaks = c(20, 60, 100, 500, 989),
+        labels = c("20", "60", "100", "500", "989")
+    ) +
+    scale_color_manual(
+        values = c(
+            "Memory Bandwidth Limit" = set1_colors[1],
+            "Standard FP32 Peak Performance" = set1_colors[2],
+            "Tensor Cores Peak Performance" = set1_colors[3])
+    ) +
+    labs(
+        x = "Arithmetic Intensity (FLOP/Byte)",
+        y = "Attainable Performance (TFLOP/s)",
+        color = "Performance Limits"
+    ) +
+    annotate("text",
+             x = h100_specs$ridge_point_standard * 2.5,
+             y = h100_specs$peak_fp32_standard_tflops * 0.98,
+             label = "Ridge Point\n(Standard FP32)",
+             size = 3.5) +
+    annotate("text",
+             x = h100_specs$ridge_point_tensor * 2.5,
+             y = h100_specs$peak_fp32_tflops * 0.99,
+             label = "Ridge Point\n(Tensor Cores)",
+             size = 3.5) +
+    theme_bw() +
+    theme(
+        legend.position = c(0.8, 0.5),
+        axis.title = element_text(size = 12),
+        legend.title = element_text(size = 11)
+    )
+
+example_apps <- tibble(
+    name = c("Tensor Compute Bound App.", "Memory Bound App.", "Compute Bound App.", "Tensor Memory Bound App."),
+    arithmetic_intensity = c(100, 0.014, 1.5, 0.1),
+    performance = c(800, 40, 55, 290)
+)
+
+roofline_plot_with_apps <- roofline_plot +
+    geom_point(data = example_apps,
+               aes(x = arithmetic_intensity, y = performance),
+               color = brewer.pal(9, "Set1")[4], size = 4, shape = 17) +
+    # geom_text(data = example_apps,
+    #           aes(x = arithmetic_intensity, y = performance * 0.82,
+    #               label = name),
+    #           size = 3.5)
+    geom_label(data = example_apps,
+              aes(x = arithmetic_intensity, y = performance * 0.82,
+                  label = name),
+              size = 3.5,
+              fill = rgb(0, 0, 0, 0.4),
+              color = "white",
+              label.padding = unit(0.15, "lines"),
+              label.size = 0)  # Removes border
+
+ggsave("results/sc25/figures/h100_roofline_model.pdf", roofline_plot,
+       width = 10, height = 7, dpi = 300)
+ggsave("results/sc25/figures/h100_roofline_model_with_apps.pdf", roofline_plot_with_apps,
+       width = 7.5, height = 4, dpi = 300)
+#+END_SRC
+
+#+RESULTS:
+: Warning message:
+: Removed 36 rows containing missing values or values outside the scale range (`geom_line()`).
+: Warning message:
+: Removed 36 rows containing missing values or values outside the scale range (`geom_line()`).

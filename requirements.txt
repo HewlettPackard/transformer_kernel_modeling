@@ -1,0 +1,6 @@
+click==8.1.8
+scipy==1.15.2
+gpytorch==1.14
+pandas==2.2.3
+tqdm==4.67.1
+torcheval==0.0.7
